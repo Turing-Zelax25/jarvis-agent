@@ -2,12 +2,17 @@
 
 Provides Chrome control via Playwright (CDP attach) or a simple webbrowser fallback.
 Playwright is optional — install with: uv add 'jarvis-agent[browser]'
+
+Chrome must be running with --remote-debugging-port=<port> for CDP tools to work.
+Use browser_launch() to start a managed Chrome instance if one is not already running.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
+import subprocess
 import webbrowser
 from typing import Any
 
@@ -21,11 +26,20 @@ browser_server = fastmcp.FastMCP("browser")
 # Check if Playwright is installed (optional dependency)
 try:
     import playwright  # type: ignore[import-untyped]  # noqa: F401
-    from playwright.async_api import async_playwright  # type: ignore[import-untyped]
+    from playwright.async_api import (  # type: ignore[import-untyped]
+        Browser,
+        BrowserType,
+        Error as PlaywrightError,
+        async_playwright,
+    )
 
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
+    async_playwright = None  # type: ignore[assignment,misc]
+    PlaywrightError = Exception  # type: ignore[assignment,misc]
+    Browser = None  # type: ignore[assignment,misc]
+    BrowserType = None  # type: ignore[assignment,misc]
 
 
 def _require_playwright() -> None:
@@ -41,7 +55,153 @@ def _get_cdp_url() -> str:
     return os.environ.get("CHROME_CDP_URL", "http://localhost:9222")
 
 
+def _cdp_error(exc: Exception) -> ToolError:
+    """Convert a Playwright CDP exception to a descriptive ToolError."""
+    msg = str(exc)
+    if "connect" in msg.lower() or "ECONNREFUSED" in msg or "net::ERR" in msg:
+        return ToolError(
+            f"Chrome is not reachable at {_get_cdp_url()}. "
+            "Start Chrome with --remote-debugging-port=9222 or call browser_launch() first. "
+            f"Original error: {exc}"
+        )
+    if "disconnected" in msg.lower() or "Target closed" in msg:
+        return ToolError(
+            f"Browser disconnected unexpectedly. "
+            "The Chrome window may have been closed. "
+            f"Original error: {exc}"
+        )
+    return ToolError(f"Browser error: {exc}")
+
+
 # ── Tools ──────────────────────────────────────────────────────────────────────
+
+
+@browser_server.tool()
+async def browser_launch(
+    port: int = 9222,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+) -> dict[str, Any]:
+    """Launch a Chromium browser instance with the CDP remote-debugging port open.
+
+    If Playwright is installed, uses the Playwright-managed Chromium binary.
+    Otherwise attempts to find a system Chrome/Chromium executable.
+
+    Args:
+        port: Remote-debugging port to open (default 9222).
+              Also sets the CHROME_CDP_URL environment variable for subsequent calls.
+        headless: Run in headless mode (default False — visible window on desktop).
+        extra_args: Additional Chrome command-line flags (e.g. ["--start-maximized"]).
+
+    Returns:
+        dict with 'status', 'cdp_url', 'pid', and 'headless' fields.
+    """
+    cdp_url = f"http://localhost:{port}"
+    os.environ["CHROME_CDP_URL"] = cdp_url
+
+    if _PLAYWRIGHT_AVAILABLE:
+        # Use playwright-managed Chromium so we know the binary exists
+        import playwright.async_api as _pw  # type: ignore[import-untyped]
+
+        async with async_playwright() as p:
+            launch_args = [
+                f"--remote-debugging-port={port}",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ] + (extra_args or [])
+
+            try:
+                browser = await p.chromium.launch(  # type: ignore[union-attr]
+                    headless=headless,
+                    args=launch_args,
+                )
+                # Detach — we don't own this process; it should outlive us
+                # Playwright doesn't provide .pid directly; use CDP to get it
+                pid: int | None = None
+                try:
+                    version_info = await browser.new_page()
+                    pid_result = await version_info.evaluate("() => process.pid")
+                    pid = int(pid_result) if pid_result else None
+                    await version_info.close()
+                except Exception:
+                    pass
+
+                logger.info(
+                    "Launched Playwright Chromium: cdp_url=%s headless=%s pid=%s",
+                    cdp_url, headless, pid,
+                )
+                return {
+                    "status": "launched",
+                    "cdp_url": cdp_url,
+                    "pid": pid,
+                    "headless": headless,
+                }
+            except _pw.Error as exc:
+                raise ToolError(f"Failed to launch Chromium: {exc}") from exc
+    else:
+        # Fallback: find a system Chrome/Chromium binary and launch it
+        candidates = [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium-browser",
+            "chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+        chrome_bin: str | None = None
+        for candidate in candidates:
+            try:
+                result = subprocess.run(
+                    ["which", candidate], capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    chrome_bin = result.stdout.strip()
+                    break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                if os.path.isfile(candidate):
+                    chrome_bin = candidate
+                    break
+
+        if chrome_bin is None:
+            raise ToolError(
+                "No Chrome/Chromium executable found. "
+                "Install Playwright (uv add 'jarvis-agent[browser]' && playwright install chromium) "
+                "or install Google Chrome."
+            )
+
+        cmd = [
+            chrome_bin,
+            f"--remote-debugging-port={port}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if headless:
+            cmd.append("--headless=new")
+        if extra_args:
+            cmd.extend(extra_args)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info(
+                "Launched system Chrome: bin=%s cdp_url=%s pid=%d headless=%s",
+                chrome_bin, cdp_url, proc.pid, headless,
+            )
+            return {
+                "status": "launched",
+                "cdp_url": cdp_url,
+                "pid": proc.pid,
+                "headless": headless,
+            }
+        except OSError as exc:
+            raise ToolError(f"Failed to launch Chrome at {chrome_bin!r}: {exc}") from exc
 
 
 @browser_server.tool()
@@ -60,14 +220,20 @@ async def browser_navigate(url: str) -> dict[str, str]:
 
     if _PLAYWRIGHT_AVAILABLE:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(_get_cdp_url())
+            try:
+                browser = await p.chromium.connect_over_cdp(_get_cdp_url())
+            except Exception as exc:
+                raise _cdp_error(exc) from exc
             try:
                 page = browser.contexts[0].pages[0] if browser.contexts else None
                 if page is None:
                     context = await browser.new_context()
                     page = await context.new_page()
-                await page.goto(url, timeout=30_000)
-                current_url = page.url
+                try:
+                    await page.goto(url, timeout=30_000)
+                    current_url = page.url
+                except Exception as exc:
+                    raise _cdp_error(exc) from exc
             finally:
                 await browser.close()
         return {"status": "navigated", "current_url": current_url}
@@ -90,16 +256,22 @@ async def browser_get_page_text(url: str | None = None) -> dict[str, Any]:
     _require_playwright()
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(_get_cdp_url())
+        try:
+            browser = await p.chromium.connect_over_cdp(_get_cdp_url())
+        except Exception as exc:
+            raise _cdp_error(exc) from exc
         try:
             page = browser.contexts[0].pages[0] if browser.contexts else None
             if page is None:
                 context = await browser.new_context()
                 page = await context.new_page()
-            if url:
-                await page.goto(url, timeout=30_000)
-            title = await page.title()
-            text = await page.inner_text("body")
+            try:
+                if url:
+                    await page.goto(url, timeout=30_000)
+                title = await page.title()
+                text = await page.inner_text("body")
+            except Exception as exc:
+                raise _cdp_error(exc) from exc
         finally:
             await browser.close()
 
@@ -124,10 +296,18 @@ async def browser_click(selector: str) -> dict[str, str]:
     logger.info("Clicking element: %s", selector)
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(_get_cdp_url())
         try:
+            browser = await p.chromium.connect_over_cdp(_get_cdp_url())
+        except Exception as exc:
+            raise _cdp_error(exc) from exc
+        try:
+            if not browser.contexts or not browser.contexts[0].pages:
+                raise ToolError("No open pages in the connected browser.")
             page = browser.contexts[0].pages[0]
-            await page.click(selector, timeout=10_000)
+            try:
+                await page.click(selector, timeout=10_000)
+            except Exception as exc:
+                raise _cdp_error(exc) from exc
         finally:
             await browser.close()
 
@@ -149,10 +329,18 @@ async def browser_type(selector: str, text: str) -> dict[str, str]:
     logger.info("Typing into: %s", selector)
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(_get_cdp_url())
         try:
+            browser = await p.chromium.connect_over_cdp(_get_cdp_url())
+        except Exception as exc:
+            raise _cdp_error(exc) from exc
+        try:
+            if not browser.contexts or not browser.contexts[0].pages:
+                raise ToolError("No open pages in the connected browser.")
             page = browser.contexts[0].pages[0]
-            await page.fill(selector, text, timeout=10_000)
+            try:
+                await page.fill(selector, text, timeout=10_000)
+            except Exception as exc:
+                raise _cdp_error(exc) from exc
         finally:
             await browser.close()
 
@@ -170,12 +358,19 @@ async def browser_screenshot() -> dict[str, Any]:
     logger.info("Taking browser screenshot")
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(_get_cdp_url())
         try:
+            browser = await p.chromium.connect_over_cdp(_get_cdp_url())
+        except Exception as exc:
+            raise _cdp_error(exc) from exc
+        try:
+            if not browser.contexts or not browser.contexts[0].pages:
+                raise ToolError("No open pages in the connected browser.")
             page = browser.contexts[0].pages[0]
-            buf = await page.screenshot(type="png")
-            # Get dimensions via JS
-            dims = await page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+            try:
+                buf = await page.screenshot(type="png")
+                dims = await page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+            except Exception as exc:
+                raise _cdp_error(exc) from exc
         finally:
             await browser.close()
 
