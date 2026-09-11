@@ -99,47 +99,27 @@ async def browser_launch(
     cdp_url = f"http://localhost:{port}"
     os.environ["CHROME_CDP_URL"] = cdp_url
 
+    chrome_bin: str | None = None
+
     if _PLAYWRIGHT_AVAILABLE:
-        # Use playwright-managed Chromium so we know the binary exists
-        import playwright.async_api as _pw  # type: ignore[import-untyped]
+        # Ask Playwright for the managed Chromium binary path, but launch it
+        # ourselves via subprocess.Popen so the process is fully detached and
+        # outlives this coroutine. Launching through `p.chromium.launch()`
+        # inside an `async with async_playwright()` block ties the browser's
+        # lifetime to the driver connection: when the `async with` exits at
+        # the end of this function, Playwright terminates every browser it
+        # spawned, so subsequent browser_navigate()/browser_screenshot() CDP
+        # connects would fail with ECONNREFUSED even though this function
+        # reported "status": "launched".
+        try:
+            async with async_playwright() as p:
+                chrome_bin = p.chromium.executable_path
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not resolve Playwright Chromium path: %s", exc)
+            chrome_bin = None
 
-        async with async_playwright() as p:
-            launch_args = [
-                f"--remote-debugging-port={port}",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ] + (extra_args or [])
-
-            try:
-                browser = await p.chromium.launch(  # type: ignore[union-attr]
-                    headless=headless,
-                    args=launch_args,
-                )
-                # Detach — we don't own this process; it should outlive us
-                # Playwright doesn't provide .pid directly; use CDP to get it
-                pid: int | None = None
-                try:
-                    version_info = await browser.new_page()
-                    pid_result = await version_info.evaluate("() => process.pid")
-                    pid = int(pid_result) if pid_result else None
-                    await version_info.close()
-                except Exception:
-                    pass
-
-                logger.info(
-                    "Launched Playwright Chromium: cdp_url=%s headless=%s pid=%s",
-                    cdp_url, headless, pid,
-                )
-                return {
-                    "status": "launched",
-                    "cdp_url": cdp_url,
-                    "pid": pid,
-                    "headless": headless,
-                }
-            except _pw.Error as exc:
-                raise ToolError(f"Failed to launch Chromium: {exc}") from exc
-    else:
-        # Fallback: find a system Chrome/Chromium binary and launch it
+    if chrome_bin is None or not os.path.isfile(chrome_bin):
+        # Fallback: find a system Chrome/Chromium binary
         candidates = [
             "google-chrome",
             "google-chrome-stable",
@@ -152,7 +132,7 @@ async def browser_launch(
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         ]
-        chrome_bin: str | None = None
+        chrome_bin = None
         for candidate in candidates:
             try:
                 result = subprocess.run(
@@ -166,42 +146,43 @@ async def browser_launch(
                     chrome_bin = candidate
                     break
 
-        if chrome_bin is None:
-            raise ToolError(
-                "No Chrome/Chromium executable found. "
-                "Install Playwright (uv add 'jarvis-agent[browser]' && playwright install chromium) "
-                "or install Google Chrome."
-            )
+    if chrome_bin is None:
+        raise ToolError(
+            "No Chrome/Chromium executable found. "
+            "Install Playwright (uv add 'jarvis-agent[browser]' && playwright install chromium) "
+            "or install Google Chrome."
+        )
 
-        cmd = [
-            chrome_bin,
-            f"--remote-debugging-port={port}",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
-        if headless:
-            cmd.append("--headless=new")
-        if extra_args:
-            cmd.extend(extra_args)
+    cmd = [
+        chrome_bin,
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if headless:
+        cmd.append("--headless=new")
+    if extra_args:
+        cmd.extend(extra_args)
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            logger.info(
-                "Launched system Chrome: bin=%s cdp_url=%s pid=%d headless=%s",
-                chrome_bin, cdp_url, proc.pid, headless,
-            )
-            return {
-                "status": "launched",
-                "cdp_url": cdp_url,
-                "pid": proc.pid,
-                "headless": headless,
-            }
-        except OSError as exc:
-            raise ToolError(f"Failed to launch Chrome at {chrome_bin!r}: {exc}") from exc
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.info(
+            "Launched Chrome: bin=%s cdp_url=%s pid=%d headless=%s",
+            chrome_bin, cdp_url, proc.pid, headless,
+        )
+        return {
+            "status": "launched",
+            "cdp_url": cdp_url,
+            "pid": proc.pid,
+            "headless": headless,
+        }
+    except OSError as exc:
+        raise ToolError(f"Failed to launch Chrome at {chrome_bin!r}: {exc}") from exc
 
 
 @browser_server.tool()

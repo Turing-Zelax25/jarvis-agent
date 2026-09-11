@@ -303,6 +303,59 @@ async def test_browser_launch_system_chrome_fallback(monkeypatch: pytest.MonkeyP
     assert any("--headless" in arg for arg in popen_cmd)
 
 
+@pytest.mark.asyncio
+async def test_browser_launch_playwright_path_detaches_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """browser_launch resolves the Playwright Chromium binary but starts it via
+    subprocess.Popen (not p.chromium.launch inside the `async with` block), so
+    the browser process survives after async_playwright() exits and remains
+    reachable over CDP for subsequent tool calls.
+
+    Regression test: an earlier implementation called
+    `await p.chromium.launch(...)` inside `async with async_playwright() as p:`.
+    Playwright kills every browser it spawned when that block exits, so the
+    process was already dead by the time browser_navigate() tried to connect
+    over CDP, even though browser_launch() had reported status="launched".
+    """
+    pytest.importorskip("fastmcp")
+    pytest.importorskip("playwright")
+
+    import jarvis_agent.modules.browser as bmod
+
+    fake_exe = "/fake/path/to/chrome"
+
+    class _FakePlaywrightHandle:
+        chromium = MagicMock(executable_path=fake_exe)
+
+    class _FakeAsyncPlaywright:
+        async def __aenter__(self):
+            return _FakePlaywrightHandle()
+
+        async def __aexit__(self, *_: Any) -> None:
+            pass
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 4242
+
+    monkeypatch.setattr(bmod, "async_playwright", lambda: _FakeAsyncPlaywright())
+
+    with patch("os.path.isfile", return_value=True), \
+         patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
+        result = await bmod.browser_launch(port=9222, headless=True)
+
+    assert result == {
+        "status": "launched",
+        "cdp_url": "http://localhost:9222",
+        "pid": 4242,
+        "headless": True,
+    }
+    # Launched via subprocess.Popen (detached), never via p.chromium.launch()
+    popen_cmd = mock_popen.call_args[0][0]
+    assert popen_cmd[0] == fake_exe
+    assert mock_popen.call_args.kwargs.get("start_new_session") is True
+
+
 # ── CDP disconnection error handling ─────────────────────────────────────────
 
 
