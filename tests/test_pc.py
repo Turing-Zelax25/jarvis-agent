@@ -12,7 +12,7 @@ import platform
 import subprocess
 import sys
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -166,7 +166,53 @@ def test_pc_launch_app_permission_blocked(monkeypatch: pytest.MonkeyPatch) -> No
         pc_launch_app("anything.exe")
 
 
+def test_pc_launch_app_windows_quotes_paths_with_spaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pc_launch_app on Windows should quote args via list2cmdline, not a naive join.
+
+    Regression test: a raw " ".join(cmd) passed to shell=True would split
+    'C:\\Program Files\\App\\app.exe' into two shell tokens and also let any
+    shell metacharacter in an arg break out into a second command.
+    """
+    pytest.importorskip("fastmcp")
+    from jarvis_agent.modules.pc import pc_launch_app
+
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 4242
+
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        result = pc_launch_app(
+            r"C:\Program Files\App\app.exe", args=["--flag", "a value"]
+        )
+
+    assert result["status"] == "launched"
+    mock_popen.assert_called_once()
+    call_args, call_kwargs = mock_popen.call_args
+    assert call_kwargs["shell"] is True
+    launched = call_args[0]
+    assert isinstance(launched, str)
+    # list2cmdline quotes any token containing a space
+    assert '"C:\\Program Files\\App\\app.exe"' in launched
+    assert '"a value"' in launched
+
+
 # ── pc_open_file ───────────────────────────────────────────────────────────────
+
+
+def test_pc_open_file_permission_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pc_open_file should raise ToolError when JARVIS_REQUIRE_CONFIRM is not false."""
+    pytest.importorskip("fastmcp")
+    from fastmcp.exceptions import ToolError
+    from jarvis_agent.modules.pc import pc_open_file
+
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "true")
+
+    with pytest.raises(ToolError, match="Permission required"):
+        pc_open_file("/tmp/report.pdf")
 
 
 def test_pc_open_file_linux(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,6 +220,7 @@ def test_pc_open_file_linux(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("fastmcp")
     from jarvis_agent.modules.pc import pc_open_file
 
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
     monkeypatch.setattr(platform, "system", lambda: "Linux")
 
     with patch("subprocess.Popen") as mock_popen:
@@ -192,6 +239,7 @@ def test_pc_open_file_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("fastmcp")
     from jarvis_agent.modules.pc import pc_open_file
 
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
 
     with patch("subprocess.Popen") as mock_popen:
@@ -208,6 +256,7 @@ def test_pc_open_file_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     from jarvis_agent.modules.pc import pc_open_file
     import jarvis_agent.modules.pc as pc_mod
 
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
     monkeypatch.setattr(platform, "system", lambda: "Windows")
 
     # os.startfile doesn't exist on Linux; inject it into the module's os reference
@@ -226,6 +275,7 @@ def test_pc_open_file_os_error(monkeypatch: pytest.MonkeyPatch) -> None:
     from fastmcp.exceptions import ToolError
     from jarvis_agent.modules.pc import pc_open_file
 
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
     monkeypatch.setattr(platform, "system", lambda: "Linux")
 
     with patch("subprocess.Popen", side_effect=OSError("permission denied")):

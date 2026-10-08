@@ -68,7 +68,7 @@ def pc_launch_app(app_name: str, args: list[str] | None = None) -> dict[str, Any
 
     try:
         proc = subprocess.Popen(
-            cmd if not use_shell else " ".join(cmd),
+            cmd if not use_shell else subprocess.list2cmdline(cmd),
             shell=use_shell,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -84,12 +84,15 @@ def pc_launch_app(app_name: str, args: list[str] | None = None) -> dict[str, Any
 def pc_open_file(path: str) -> dict[str, str]:
     """Open a file with its default application.
 
+    Requires JARVIS_REQUIRE_CONFIRM=false to execute.
+
     Args:
         path: Absolute or relative path to the file.
 
     Returns:
         dict with 'status' and 'path' fields.
     """
+    _permission_gate("pc_open_file", f"path={path!r}")
     logger.info("Opening file: %s", path)
     system = platform.system()
     try:
