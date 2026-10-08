@@ -55,13 +55,14 @@ All settings via environment variables:
 | Tool              | Description                                             |
 |-------------------|---------------------------------------------------------|
 | `pc_pc_launch_app` | Launch an application by name (gated by permission)   |
-| `pc_pc_open_file`  | Open a file with its default application              |
+| `pc_pc_open_file`  | Open a file with its default application (gated by permission) |
 | `pc_pc_screenshot` | Take a screenshot → base64 PNG                        |
 | `pc_pc_media_key`  | Send media key (play/pause, next, prev, vol, mute) (gated) |
 
 ### `browser.*`
 | Tool                      | Description                                   |
 |---------------------------|-----------------------------------------------|
+| `browser_browser_launch`         | Launch Chromium with CDP open (gated by permission; denylists dangerous flags) |
 | `browser_browser_navigate`       | Navigate to a URL                      |
 | `browser_browser_get_page_text`  | Extract page text content              |
 | `browser_browser_click`          | Click element by CSS selector          |

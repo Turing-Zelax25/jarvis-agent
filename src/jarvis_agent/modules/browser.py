@@ -23,6 +23,62 @@ logger = logging.getLogger(__name__)
 
 browser_server = fastmcp.FastMCP("browser")
 
+# Chrome flags that are known command-execution-via-flag vectors (the flag
+# value is used as a prefix when Chrome spawns its own child processes) or
+# that materially widen the network/trust boundary. Rejected outright rather
+# than passed through, regardless of the permission gate.
+_DENYLISTED_CHROME_FLAG_PREFIXES: tuple[str, ...] = (
+    "--renderer-cmd-prefix",
+    "--utility-cmd-prefix",
+    "--gpu-launcher",
+    "--plugin-launcher",
+    "--remote-debugging-address",
+    "--load-extension",
+    "--disable-web-security",
+)
+
+
+def _permission_gate(tool_name: str, params_summary: str) -> None:
+    """Raise ToolError if JARVIS_REQUIRE_CONFIRM is set to true.
+
+    Mirrors jarvis_agent.modules.pc._permission_gate — duplicated locally so
+    this module has no import-time dependency on pc.py.
+
+    Args:
+        tool_name: Name of the tool requesting permission.
+        params_summary: Human-readable summary of the action parameters.
+
+    Raises:
+        ToolError: If confirmation is required but not given.
+    """
+    require = os.environ.get("JARVIS_REQUIRE_CONFIRM", "true").lower()
+    if require not in ("false", "0", "no"):
+        raise ToolError(
+            f"Permission required for '{tool_name}' ({params_summary}). "
+            "Set JARVIS_REQUIRE_CONFIRM=false to allow without confirmation, "
+            "or implement the confirmation flow."
+        )
+
+
+def _validate_extra_args(extra_args: list[str] | None) -> None:
+    """Reject Chrome command-line flags known to be dangerous.
+
+    Args:
+        extra_args: Caller-supplied extra Chrome flags, if any.
+
+    Raises:
+        ToolError: If any flag matches a denylisted prefix.
+    """
+    if not extra_args:
+        return
+    for flag in extra_args:
+        for bad_prefix in _DENYLISTED_CHROME_FLAG_PREFIXES:
+            if flag == bad_prefix or flag.startswith(bad_prefix + "="):
+                raise ToolError(
+                    f"Chrome flag {flag!r} is not allowed via extra_args "
+                    f"(denylisted prefix: {bad_prefix!r})."
+                )
+
 # Check if Playwright is installed (optional dependency)
 try:
     import playwright  # type: ignore[import-untyped]  # noqa: F401
@@ -92,10 +148,18 @@ async def browser_launch(
               Also sets the CHROME_CDP_URL environment variable for subsequent calls.
         headless: Run in headless mode (default False — visible window on desktop).
         extra_args: Additional Chrome command-line flags (e.g. ["--start-maximized"]).
+                    A fixed denylist of dangerous flags (e.g. --renderer-cmd-prefix,
+                    --load-extension, --remote-debugging-address) is rejected
+                    regardless of the permission gate.
 
     Returns:
         dict with 'status', 'cdp_url', 'pid', and 'headless' fields.
     """
+    _permission_gate(
+        "browser_launch", f"port={port!r} headless={headless!r} extra_args={extra_args!r}"
+    )
+    _validate_extra_args(extra_args)
+
     cdp_url = f"http://localhost:{port}"
     os.environ["CHROME_CDP_URL"] = cdp_url
 

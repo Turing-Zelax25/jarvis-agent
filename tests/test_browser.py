@@ -270,6 +270,7 @@ async def test_browser_launch_no_chrome_raises_when_playwright_missing(
     import jarvis_agent.modules.browser as bmod
 
     monkeypatch.setattr(bmod, "_PLAYWRIGHT_AVAILABLE", False)
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
 
     with patch("subprocess.run", return_value=MagicMock(returncode=1)), \
          patch("os.path.isfile", return_value=False):
@@ -285,6 +286,7 @@ async def test_browser_launch_system_chrome_fallback(monkeypatch: pytest.MonkeyP
     import jarvis_agent.modules.browser as bmod
 
     monkeypatch.setattr(bmod, "_PLAYWRIGHT_AVAILABLE", False)
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
 
     fake_proc = MagicMock()
     fake_proc.pid = 42
@@ -339,6 +341,7 @@ async def test_browser_launch_playwright_path_detaches_process(
     fake_proc.pid = 4242
 
     monkeypatch.setattr(bmod, "async_playwright", lambda: _FakeAsyncPlaywright())
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
 
     with patch("os.path.isfile", return_value=True), \
          patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
@@ -405,3 +408,94 @@ async def test_browser_navigate_cdp_disconnect_error_raises_tool_error() -> None
 
         with pytest.raises(ToolError, match="disconnected"):
             await browser_navigate("https://example.com")
+
+
+# ── browser_launch permission gate + flag denylist (security fix) ───────────
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_blocked_by_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """browser_launch must be gated: previously it ran unconditionally, letting
+    any caller spawn a visible Chrome window and open a CDP port with no
+    confirmation.
+    """
+    pytest.importorskip("fastmcp")
+
+    from fastmcp.exceptions import ToolError
+    import jarvis_agent.modules.browser as bmod
+
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "true")
+
+    with pytest.raises(ToolError, match="Permission required"):
+        await bmod.browser_launch()
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_blocked_when_gate_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """browser_launch defaults to blocked when JARVIS_REQUIRE_CONFIRM is unset."""
+    pytest.importorskip("fastmcp")
+
+    from fastmcp.exceptions import ToolError
+    import jarvis_agent.modules.browser as bmod
+
+    monkeypatch.delenv("JARVIS_REQUIRE_CONFIRM", raising=False)
+
+    with pytest.raises(ToolError, match="Permission required"):
+        await bmod.browser_launch()
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_rejects_denylisted_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """browser_launch must reject --renderer-cmd-prefix even with the gate open.
+
+    This flag makes Chrome spawn its renderer process via an arbitrary
+    attacker-controlled prefix command — effectively RCE via extra_args.
+    """
+    pytest.importorskip("fastmcp")
+
+    from fastmcp.exceptions import ToolError
+    import jarvis_agent.modules.browser as bmod
+
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
+
+    with pytest.raises(ToolError, match="not allowed"):
+        await bmod.browser_launch(extra_args=["--renderer-cmd-prefix=/bin/sh -c"])
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_rejects_denylisted_flag_bare_form(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Denylist match also covers a bare flag with no '=' value."""
+    pytest.importorskip("fastmcp")
+
+    from fastmcp.exceptions import ToolError
+    import jarvis_agent.modules.browser as bmod
+
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
+
+    with pytest.raises(ToolError, match="not allowed"):
+        await bmod.browser_launch(extra_args=["--disable-web-security"])
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_allows_safe_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """browser_launch still allows a harmless flag once the gate is open."""
+    pytest.importorskip("fastmcp")
+
+    import jarvis_agent.modules.browser as bmod
+
+    monkeypatch.setenv("JARVIS_REQUIRE_CONFIRM", "false")
+    monkeypatch.setattr(bmod, "_PLAYWRIGHT_AVAILABLE", False)
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 99
+
+    with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="/usr/bin/chromium\n")), \
+         patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
+        result = await bmod.browser_launch(port=9222, extra_args=["--start-maximized"])
+
+    assert result["status"] == "launched"
+    popen_cmd = mock_popen.call_args[0][0]
+    assert "--start-maximized" in popen_cmd
+

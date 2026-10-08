@@ -63,13 +63,17 @@ def pc_launch_app(app_name: str, args: list[str] | None = None) -> dict[str, Any
     _permission_gate("pc_launch_app", f"app_name={app_name!r}")
 
     cmd = [app_name, *args]
-    use_shell = platform.system() == "Windows"
-    logger.info("Launching app: %s (shell=%s)", cmd, use_shell)
+    # shell=False everywhere: CreateProcess on Windows still resolves a bare
+    # executable name via PATH when given as a list, so this does not lose
+    # the "launch by name" behavior. Using shell=True with a naive " ".join()
+    # let any arg containing &, |, or && break out into a second shell
+    # command (Windows shell-injection via pc_launch_app args).
+    logger.info("Launching app: %s", cmd)
 
     try:
         proc = subprocess.Popen(
-            cmd if not use_shell else " ".join(cmd),
-            shell=use_shell,
+            cmd,
+            shell=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -84,12 +88,19 @@ def pc_launch_app(app_name: str, args: list[str] | None = None) -> dict[str, Any
 def pc_open_file(path: str) -> dict[str, str]:
     """Open a file with its default application.
 
+    Requires JARVIS_REQUIRE_CONFIRM=false to execute. On Windows,
+    os.startfile() runs the path's registered handler — for an
+    .exe/.bat/.cmd/.ps1/.vbs/.lnk that is arbitrary code execution, not a
+    benign "open a document" action, so this is gated the same as
+    pc_launch_app and pc_media_key.
+
     Args:
         path: Absolute or relative path to the file.
 
     Returns:
         dict with 'status' and 'path' fields.
     """
+    _permission_gate("pc_open_file", f"path={path!r}")
     logger.info("Opening file: %s", path)
     system = platform.system()
     try:
